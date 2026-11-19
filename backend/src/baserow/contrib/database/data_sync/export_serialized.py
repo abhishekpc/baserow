@@ -11,8 +11,9 @@ class DataSyncExportSerializedStructure:
         }
 
     @staticmethod
-    def property(key, field_id):
+    def property(key, field_id, metadata):
         return {
             "key": key,
             "field_id": field_id,
+            "metadata": metadata,
         }

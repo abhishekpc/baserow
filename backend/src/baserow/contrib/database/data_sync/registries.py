@@ -282,12 +282,27 @@ class DataSyncType(
             last_error=instance.last_error,
             properties=[
                 DataSyncExportSerializedStructure.property(
-                    key=p.key, field_id=p.field_id
+                    key=p.key, field_id=p.field_id, metadata=p.metadata
                 )
                 for p in properties
             ],
             **type_specific,
         )
+
+    def _import_property_metadata(self, metadata, id_mapping):
+        mapping = (metadata or {}).get("select_options_mapping")
+        if not mapping:
+            return metadata
+        options = id_mapping.get("database_field_select_options", {})
+        # An unmapped target is another table's option the sync would edit or delete.
+        return {
+            **metadata,
+            "select_options_mapping": {
+                source: options[target]
+                for source, target in mapping.items()
+                if target in options
+            },
+        }
 
     def import_serialized(
         self,
@@ -338,6 +353,9 @@ class DataSyncType(
                     data_sync=data_sync,
                     field_id=mapped_field_id,
                     key=property["key"],
+                    metadata=self._import_property_metadata(
+                        property.get("metadata"), id_mapping
+                    ),
                 )
             )
 
