@@ -34,7 +34,6 @@ from baserow.contrib.agent.actions import (
 )
 from baserow.contrib.agent.exceptions import (
     AgentConversationDoesNotExist,
-    AgentConversationReadOnly,
     AgentConversationWaitingForApproval,
     AgentMessageConflict,
     AgentNotReady,
@@ -55,7 +54,6 @@ from baserow.core.service import CoreService
 from .errors import (
     ERROR_AGENT_BUSY,
     ERROR_AGENT_CONVERSATION_DOES_NOT_EXIST,
-    ERROR_AGENT_CONVERSATION_READ_ONLY,
     ERROR_AGENT_CONVERSATION_WAITING_FOR_APPROVAL,
     ERROR_AGENT_MESSAGE_CONFLICT,
     ERROR_AGENT_NOT_READY,
@@ -74,9 +72,12 @@ from .serializers import (
     AgentMessageCreateSerializer,
     AgentMessagePagination,
     AgentMessageSerializer,
-    AgentRunAsIdentitiesQueryParamsSerializer,
+    AgentOptionsQueryParamsSerializer,
+    AgentParticipantSerializer,
     AgentRunAsOptionSerializer,
     AgentToolDecisionsSerializer,
+    LeaveAgentConversationSerializer,
+    RequestAgentApprovalSerializer,
 )
 
 AGENT_ID_PATH_PARAMETER = OpenApiParameter(
@@ -88,7 +89,6 @@ AGENT_ID_PATH_PARAMETER = OpenApiParameter(
 AGENT_EXCEPTIONS = {
     ApplicationDoesNotExist: ERROR_APPLICATION_DOES_NOT_EXIST,
     AgentConversationDoesNotExist: ERROR_AGENT_CONVERSATION_DOES_NOT_EXIST,
-    AgentConversationReadOnly: ERROR_AGENT_CONVERSATION_READ_ONLY,
     AgentNotReady: ERROR_AGENT_NOT_READY,
     AgentMessageConflict: ERROR_AGENT_MESSAGE_CONFLICT,
     AgentRunAsSubjectDoesNotExist: ERROR_AGENT_RUN_AS_SUBJECT_DOES_NOT_EXIST,
@@ -118,7 +118,6 @@ MESSAGE_WRITE_ERRORS = {
     409: get_error_schema(
         [
             "ERROR_AGENT_MESSAGE_CONFLICT",
-            "ERROR_AGENT_CONVERSATION_READ_ONLY",
             "ERROR_AGENT_CONVERSATION_WAITING_FOR_APPROVAL",
             "ERROR_CHAT_RUN_IN_PROGRESS",
         ]
@@ -274,7 +273,7 @@ class AgentConfigurationView(RealtimeRecoveryPrimaryReadMixin, APIView):
 
 class AgentRunAsIdentitiesView(RealtimeRecoveryPrimaryReadMixin, APIView):
     @extend_schema(
-        parameters=[AGENT_ID_PATH_PARAMETER, AgentRunAsIdentitiesQueryParamsSerializer],
+        parameters=[AGENT_ID_PATH_PARAMETER, AgentOptionsQueryParamsSerializer],
         tags=["Agent applications"],
         operation_id="list_agent_run_as_identities",
         description="Lists active workspace identities selectable for this Agent. "
@@ -285,9 +284,7 @@ class AgentRunAsIdentitiesView(RealtimeRecoveryPrimaryReadMixin, APIView):
         },
     )
     @map_exceptions(AGENT_EXCEPTIONS)
-    @validate_query_parameters(
-        AgentRunAsIdentitiesQueryParamsSerializer, return_validated=True
-    )
+    @validate_query_parameters(AgentOptionsQueryParamsSerializer, return_validated=True)
     def get(self, request: Request, agent_id: int, query_params: dict) -> Response:
         """Return paginated choices authorized in this Agent's application scope."""
 
@@ -306,10 +303,10 @@ class AgentConversationsView(RealtimeRecoveryPrimaryReadMixin, APIView):
         tags=["Agent applications"],
         operation_id="list_agent_conversations",
         description=(
-            "Lists the authenticated user's own conversations with the agent and the "
-            "shared ones its triggers started, pinned first, then most recently active "
+            "Lists private conversations the user participates in and all shared "
+            "conversations of the agent, pinned first, then most recently active "
             "within each group. Each includes its number of tool calls waiting for the "
-            "user's approval."
+            "a decision."
         ),
         parameters=[
             AGENT_ID_PATH_PARAMETER,
@@ -346,7 +343,7 @@ class AgentConversationsView(RealtimeRecoveryPrimaryReadMixin, APIView):
     @map_exceptions(AGENT_EXCEPTIONS)
     @validate_query_parameters(AgentConversationsQuerySerializer, return_validated=True)
     def get(self, request: Request, agent_id: int, query_params: dict) -> Response:
-        """List the user's own and the shared conversations, a page at a time."""
+        """List visible conversations a page at a time."""
 
         limit = query_params["limit"]
         # One more than requested tells whether a next page exists without a count.
@@ -435,30 +432,20 @@ class AgentConversationView(APIView):
     def patch(
         self, request: Request, agent_id: int, conversation_uuid: UUID, data: dict
     ) -> Response:
-        """Updates a conversation of the authenticated owner."""
+        """Update a conversation the caller can manage."""
 
         conversation = action_type_registry.get_by_type(
             UpdateAgentConversationActionType
         ).do(request.user, agent_id, conversation_uuid, **data)
-        context = {
-            "conversation_runs": AgentHandler().get_conversation_runs(
-                [conversation.id]
-            ),
-            "conversation_pending_approvals": (
-                AgentHandler().get_conversation_pending_approval_counts(
-                    [conversation.id]
-                )
-            ),
-        }
-        return Response(AgentConversationSerializer(conversation, context=context).data)
+        return Response(_serialize_conversation(conversation))
 
     @extend_schema(
         tags=["Agent applications"],
         operation_id="delete_agent_conversation",
         description=(
-            "Moves one of the authenticated user's conversations to the trash and "
-            "stops the reply being written in it. Only the owner sees and restores "
-            "it there."
+            "Trashes the conversation for everyone and stops its active reply. "
+            "Private deletion requires authorship. Shared deletion also requires "
+            "permission to update the agent."
         ),
         parameters=[AGENT_ID_PATH_PARAMETER, CLIENT_SESSION_ID_SCHEMA_PARAMETER],
         responses={204: None, **CONVERSATION_READ_ERRORS},
@@ -467,7 +454,7 @@ class AgentConversationView(APIView):
     def delete(
         self, request: Request, agent_id: int, conversation_uuid: UUID
     ) -> Response:
-        """Trashes a conversation of the authenticated owner."""
+        """Trash a conversation the caller can manage."""
 
         action_type_registry.get_by_type(DeleteAgentConversationActionType).do(
             request.user, agent_id, conversation_uuid
@@ -480,7 +467,7 @@ class AgentMessagesView(RealtimeRecoveryPrimaryReadMixin, APIView):
         tags=["Agent applications"],
         operation_id="list_agent_messages",
         description=(
-            "Lists the messages of one of the authenticated user's conversations, "
+            "Lists the messages of a conversation the authenticated user can read, "
             "newest page first, each page in chronological order."
         ),
         parameters=[
@@ -534,7 +521,7 @@ class AgentMessagesView(RealtimeRecoveryPrimaryReadMixin, APIView):
     def post(
         self, request: Request, agent_id: int, conversation_uuid: UUID, data: dict
     ) -> Response:
-        """Accept an authorized owner's message or recover its identical retry."""
+        """Accept an authorized participant's message or recover its identical retry."""
 
         result = action_type_registry.get_by_type(CreateAgentMessageActionType).do(
             request.user, agent_id, conversation_uuid, **data
@@ -551,9 +538,8 @@ class AgentToolApprovalsView(APIView):
         tags=["Agent applications"],
         operation_id="decide_agent_tool_approvals",
         description=(
-            "Approves or rejects tool calls that the waiting reply of one of the "
-            "authenticated user's conversations, or of a shared conversation a "
-            "trigger started, holds for approval. Once none are "
+            "Approves or rejects tool calls in a visible conversation for a user "
+            "with approval permission. Once none are "
             "left to decide, a run continues the reply and the response names it. "
             "With always_allow, the tools of the approved calls stop asking first."
         ),
@@ -576,3 +562,71 @@ class AgentToolApprovalsView(APIView):
         return Response(
             AgentMessageSerializer(reply, context={"active_runs": active_runs}).data
         )
+
+
+def _serialize_conversation(conversation):
+    handler = AgentHandler()
+    context = {
+        "conversation_runs": handler.get_conversation_runs([conversation.pk]),
+        "conversation_pending_approvals": handler.get_conversation_pending_approval_counts(
+            [conversation.pk]
+        ),
+    }
+    return AgentConversationSerializer(conversation, context=context).data
+
+
+class ShareAgentConversationView(APIView):
+    @extend_schema(request=None, responses=AgentConversationSerializer)
+    @map_exceptions(AGENT_EXCEPTIONS)
+    def post(self, request, agent_id, conversation_uuid):
+        conversation = AgentService().share_conversation(
+            request.user, agent_id, conversation_uuid
+        )
+        return Response(_serialize_conversation(conversation))
+
+
+class AgentApprovalRecipientsView(APIView):
+    @extend_schema(
+        tags=["Agent applications"],
+        operation_id="list_agent_approval_recipients",
+        parameters=[AGENT_ID_PATH_PARAMETER, AgentOptionsQueryParamsSerializer],
+        responses={
+            200: get_example_pagination_serializer_class(AgentParticipantSerializer),
+            **CONVERSATION_READ_ERRORS,
+        },
+    )
+    @map_exceptions(AGENT_EXCEPTIONS)
+    @validate_query_parameters(AgentOptionsQueryParamsSerializer, return_validated=True)
+    def get(self, request, agent_id, conversation_uuid, query_params):
+        candidates = AgentService().approval_candidates(
+            request.user,
+            agent_id,
+            conversation_uuid,
+            query_params["search"],
+        )
+        paginator = PageNumberPagination(limit_page_size=100)
+        page = paginator.paginate_queryset(candidates, request, view=self)
+        return paginator.get_paginated_response(
+            [{"id": user.pk, "name": user.first_name or user.username} for user in page]
+        )
+
+    @extend_schema(
+        request=RequestAgentApprovalSerializer, responses=AgentConversationSerializer
+    )
+    @map_exceptions(AGENT_EXCEPTIONS)
+    @validate_body(RequestAgentApprovalSerializer, return_validated=True)
+    def post(self, request, agent_id, conversation_uuid, data):
+        conversation = AgentService().request_approval(
+            request.user, agent_id, conversation_uuid, **data
+        )
+        return Response(_serialize_conversation(conversation))
+
+
+class LeaveAgentConversationView(APIView):
+    @extend_schema(request=None, responses=LeaveAgentConversationSerializer)
+    @map_exceptions(AGENT_EXCEPTIONS)
+    def post(self, request, agent_id, conversation_uuid):
+        conversation = AgentService().delete_for_me(
+            request.user, agent_id, conversation_uuid
+        )
+        return Response(LeaveAgentConversationSerializer(conversation).data)

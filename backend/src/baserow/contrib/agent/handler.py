@@ -553,6 +553,13 @@ class AgentHandler:
             configuration=configuration,
         )
 
+    @staticmethod
+    def visible_to(user: AbstractUser) -> Q:
+        membership = AgentConversation.participants.through.objects.filter(
+            agentconversation_id=OuterRef("pk"), user_id=user.pk
+        )
+        return Q(shared=True) | Q(Exists(membership))
+
     def list_conversations(
         self,
         agent: AgentApplication,
@@ -574,9 +581,11 @@ class AgentHandler:
             the trigger that started each shared one.
         """
 
-        conversations = AgentConversation.objects.filter(
-            Q(owner_user=user) | Q(owner_user__isnull=True), agent=agent
-        ).select_related("trigger__service")
+        conversations = (
+            AgentConversation.objects.filter(self.visible_to(user), agent=agent)
+            .select_related("trigger__service", "owner_user")
+            .prefetch_related("participants")
+        )
         if pinned is not None:
             conversations = conversations.filter(pinned=pinned)
         if has_pending_approvals is not None:
@@ -610,7 +619,7 @@ class AgentHandler:
         for_update: bool = False,
     ) -> AgentConversation:
         """
-        Return a conversation the user sees in the agent: their own or a shared one.
+        Return a conversation shared with agent readers or including this participant.
 
         :param agent: The agent the conversation belongs to.
         :param user: The user reading the conversation.
@@ -618,22 +627,24 @@ class AgentHandler:
         :param for_update: Whether to lock the conversation until the transaction ends.
         :raises AgentConversationDoesNotExist: When the conversation doesn't exist,
             also when it belongs to another owner or agent.
-        :return: The conversation, with the agent it was found in, and the user as
-            its owner unless it is shared.
+        :return: The conversation with its agent.
         """
 
-        queryset = AgentConversation.objects.filter(
-            Q(owner_user=user) | Q(owner_user__isnull=True)
-        )
+        queryset = AgentConversation.objects.filter(self.visible_to(user))
         if for_update:
             queryset = queryset.select_for_update(of=("self",))
         try:
             conversation = queryset.get(uuid=uuid, agent=agent)
         except AgentConversation.DoesNotExist as exc:
             raise AgentConversationDoesNotExist from exc
+        # A participant may have left while this transaction waited for the row lock.
+        if (
+            for_update
+            and not conversation.shared
+            and not conversation.participants.filter(pk=user.pk).exists()
+        ):
+            raise AgentConversationDoesNotExist
         conversation.agent = agent
-        if not conversation.is_shared:
-            conversation.owner_user = user
         return conversation
 
     def update_conversation(
@@ -728,6 +739,10 @@ class AgentHandler:
             conversation.trashed
             or conversation.agent_id != agent.id
             or conversation.owner_user_id != owner.id
+            or (
+                not conversation.shared
+                and not conversation.participants.filter(pk=owner.pk).exists()
+            )
         ):
             raise AgentConversationDoesNotExist
         message = conversation.messages.order_by("id").first()
@@ -809,7 +824,8 @@ class AgentHandler:
                 message_uuid,
                 content,
             )
-        return self._add_message(conversation, content, uuid=message_uuid)
+        conversation.participants.add(user)
+        return self._add_message(conversation, content, uuid=message_uuid, sender=user)
 
     def start_trigger_conversation(
         self,
@@ -841,7 +857,8 @@ class AgentHandler:
         conversation = AgentConversation.objects.create(
             uuid=uuid4(),
             agent=trigger.agent,
-            owner_user=None,
+            shared=True,
+            started_by_trigger=True,
             trigger=trigger,
             title=normalize_title(content),
         )
@@ -856,7 +873,11 @@ class AgentHandler:
         )
 
     def get_message_retry(
-        self, conversation: AgentConversation, uuid: UUID, content: str
+        self,
+        conversation: AgentConversation,
+        uuid: UUID,
+        content: str,
+        sender: AbstractUser,
     ) -> AgentMessageCreated | None:
         """
         Return the message already accepted for a message uuid.
@@ -872,12 +893,20 @@ class AgentHandler:
         message = conversation.messages.filter(uuid=uuid).first()
         if message is None:
             return None
-        if message.content != content:
+        if (
+            message.sender_id != sender.pk
+            or message.role != AgentMessage.Role.USER
+            or message.content != content
+        ):
             raise AgentMessageConflict
         return self._accepted(conversation, message)
 
     def create_message(
-        self, conversation: AgentConversation, uuid: UUID, content: str
+        self,
+        conversation: AgentConversation,
+        uuid: UUID,
+        content: str,
+        sender: AbstractUser,
     ) -> AgentMessageCreated:
         """
         Add a user message with an empty reply, and start the run writing it.
@@ -893,7 +922,7 @@ class AgentHandler:
         """
 
         conversation.save(update_fields=["updated_on"])
-        return self._add_message(conversation, content, uuid=uuid)
+        return self._add_message(conversation, content, uuid=uuid, sender=sender)
 
     def _add_message(
         self,
@@ -901,6 +930,7 @@ class AgentHandler:
         content: str,
         role: AgentMessage.Role = AgentMessage.Role.USER,
         uuid: UUID | None = None,
+        sender: AbstractUser | None = None,
         raise_on_run_limit: bool = True,
         failure: str | None = None,
         start_run: bool = True,
@@ -930,12 +960,15 @@ class AgentHandler:
             conversation=conversation,
             uuid=uuid or uuid4(),
             role=role,
+            sender=sender,
             content=content,
         )
         reply = AgentMessage.objects.create(
             conversation=conversation,
             uuid=uuid4(),
             role=AgentMessage.Role.ASSISTANT,
+            sender=sender,
+            unattended=role == AgentMessage.Role.TRIGGER,
             content="",
             status=AgentReplyStatus.RUNNING if start_run else AgentReplyStatus.QUEUED,
         )
@@ -963,11 +996,13 @@ class AgentHandler:
         )
 
     def _start_reply_run(
-        self, conversation: AgentConversation, reply: AgentMessage
+        self,
+        conversation: AgentConversation,
+        reply: AgentMessage,
+        approval_actor: AbstractUser | None = None,
     ) -> ChatRun:
         """
-        Start the run writing the reply: as the owner, or with nobody for a shared
-        conversation's unattended reply.
+        Start a human reply for its sender or approver. Trigger replies stay unattended.
 
         :param conversation: The conversation, with its agent and owner.
         :param reply: The empty reply the run writes.
@@ -979,12 +1014,19 @@ class AgentHandler:
             AGENT_RUN_TYPE,
             conversation.id,
             conversation.agent.workspace,
-            conversation.owner_user,
-            context={"reply_id": reply.id},
+            reply.sender
+            if reply.unattended or approval_actor is None
+            else approval_actor,
+            context={
+                "reply_id": reply.id,
+                **({"approval_actor_id": approval_actor.pk} if approval_actor else {}),
+            },
             created_event_data={},
         )
 
-    def _start_existing_reply(self, reply: AgentMessage) -> ChatRun:
+    def _start_existing_reply(
+        self, reply: AgentMessage, approval_actor: AbstractUser | None = None
+    ) -> ChatRun:
         """
         Mark a saved reply running and start the run writing it, as its
         conversation's latest activity.
@@ -998,7 +1040,7 @@ class AgentHandler:
         conversation.save(update_fields=["updated_on"])
         reply.status = AgentReplyStatus.RUNNING
         reply.save(update_fields=["status", "updated_on"])
-        return self._start_reply_run(conversation, reply)
+        return self._start_reply_run(conversation, reply, approval_actor)
 
     def start_queued_replies(self, trigger: AgentTrigger) -> list[AgentMessage]:
         """
@@ -1114,16 +1156,17 @@ class AgentHandler:
         for user_id, agent_id, count in (
             self._pending_approvals()
             .filter(
-                reply__conversation__owner_user_id__in=user_ids,
+                reply__conversation__shared=False,
+                reply__conversation__participants__id__in=user_ids,
                 reply__conversation__agent_id__in=agent_ids,
                 reply__conversation__trashed=False,
             )
             .values(
-                "reply__conversation__owner_user_id", "reply__conversation__agent_id"
+                "reply__conversation__participants__id", "reply__conversation__agent_id"
             )
             .annotate(count=Count("id"))
             .values_list(
-                "reply__conversation__owner_user_id",
+                "reply__conversation__participants__id",
                 "reply__conversation__agent_id",
                 "count",
             )
@@ -1146,7 +1189,7 @@ class AgentHandler:
         return dict(
             self._pending_approvals()
             .filter(
-                reply__conversation__owner_user__isnull=True,
+                reply__conversation__shared=True,
                 reply__conversation__agent_id__in=agent_ids,
                 reply__conversation__trashed=False,
             )
@@ -1204,7 +1247,7 @@ class AgentHandler:
         prefetch_related_objects([reply], "approvals")
         return reply, decided, not pending
 
-    def resume_reply(self, reply: AgentMessage) -> ChatRun:
+    def resume_reply(self, reply: AgentMessage, actor: AbstractUser) -> ChatRun:
         """
         Start the run continuing a reply whose held calls are all decided.
 
@@ -1216,7 +1259,7 @@ class AgentHandler:
         :return: The run continuing the reply.
         """
 
-        return self._start_existing_reply(reply)
+        return self._start_existing_reply(reply, actor)
 
     def get_active_reply_runs(self, conversation: AgentConversation) -> dict[int, UUID]:
         """
@@ -1261,7 +1304,7 @@ class AgentHandler:
         """
 
         return AgentConversation.objects.filter(
-            Q(owner_user_id=user.id) | Q(owner_user__isnull=True),
+            self.visible_to(user),
             agent__trashed=False,
             agent__workspace__trashed=False,
             agent__workspace__workspaceuser__user_id=user.id,
@@ -1281,7 +1324,7 @@ class AgentHandler:
         reply = (
             AgentMessage.objects.select_related(
                 "conversation__agent__workspace",
-                "conversation__owner_user",
+                "sender__profile",
                 "conversation__trigger",
             )
             .filter(id=reply_id, conversation__trashed=False)
@@ -1394,12 +1437,12 @@ class AgentHandler:
             allowed_tool_names=tools["allowed_tools"],
             ask_first_tool_names=tools["ask_first_tools"],
             action_tools=action_tools,
-            timezone=self._get_reply_timezone(conversation),
+            timezone=self._get_reply_timezone(reply),
             mcp_servers=mcp_servers,
             reasoning_effort=agent.reasoning_effort,
             web_search_tool=web_search_tool,
             web_search_enabled=agent.web_search_enabled,
-            started_by_trigger=conversation.is_shared,
+            started_by_trigger=reply.unattended,
             web_fetch_enabled=web_fetch_enabled,
         )
 
@@ -1463,17 +1506,10 @@ class AgentHandler:
             )
         return tuple(snapshots)
 
-    def _get_reply_timezone(self, conversation: AgentConversation) -> str:
-        """
-        :param conversation: The conversation the reply is written in.
-        :return: The timezone the reply's tools read dates in: the owner's, or for
-            a shared conversation its trigger's, so "today" means the day the
-            builder scheduled it for.
-        """
-
-        if not conversation.is_shared:
-            return conversation.owner_user.profile.timezone
-        return trigger_timezone_name(conversation.trigger.service.specific)
+    def _get_reply_timezone(self, reply: AgentMessage) -> str:
+        if reply.unattended:
+            return trigger_timezone_name(reply.conversation.trigger.service.specific)
+        return reply.sender.profile.timezone if reply.sender_id else "UTC"
 
     def _get_paused_transcript(
         self, reply: AgentMessage
@@ -1833,12 +1869,13 @@ class AgentHandler:
             AgentConversation.objects.filter(agent=agent)
             .order_by("id")
             .prefetch_related(
+                "participants",
                 Prefetch(
                     "messages",
                     queryset=AgentMessage.objects.order_by("id").prefetch_related(
                         "approvals"
                     ),
-                )
+                ),
             )
         )
         return [
@@ -1846,12 +1883,17 @@ class AgentHandler:
                 "title": conversation.title,
                 "pinned": conversation.pinned,
                 "owner_user_id": conversation.owner_user_id,
+                "participant_ids": [u.pk for u in conversation.participants.all()],
+                "shared": conversation.shared,
+                "started_by_trigger": conversation.started_by_trigger,
                 "trigger_id": conversation.trigger_id,
                 "created_on": conversation.created_on.isoformat(),
                 "updated_on": conversation.updated_on.isoformat(),
                 "messages": [
                     {
                         "role": message.role,
+                        "sender_id": message.sender_id,
+                        "unattended": message.unattended,
                         "content": message.content,
                         "status": message.status,
                         "error_code": message.error_code,
@@ -1879,7 +1921,7 @@ class AgentHandler:
     ) -> None:
         """
         Copy conversations with their messages into the agent with new uuids.
-        Conversations of deleted owners are skipped, shared ones are always kept,
+        Private conversations with no remaining participants are skipped,
         and a reply still being written or waiting for approvals is ended as
         interrupted. A conversation whose trigger wasn't copied loses the link,
         as it does when the trigger is deleted.
@@ -1890,22 +1932,29 @@ class AgentHandler:
             the agent's triggers were imported under.
         """
 
-        existing_owner_ids = set(
-            get_user_model()
-            .objects.filter(
-                id__in=[
-                    data["owner_user_id"]
-                    for data in serialized_conversations
-                    if data["owner_user_id"] is not None
-                ]
+        referenced_users = set()
+        for data in serialized_conversations:
+            referenced_users.add(data["owner_user_id"])
+            referenced_users.update(data.get("participant_ids", []))
+            referenced_users.update(
+                message.get("sender_id") for message in data["messages"]
             )
-            .values_list("id", flat=True)
+        existing_users = set(
+            get_user_model()
+            .objects.filter(pk__in=referenced_users)
+            .values_list("pk", flat=True)
         )
+
+        def participant_ids(data):
+            return existing_users.intersection(
+                data.get("participant_ids", [data["owner_user_id"]])
+            )
+
         retained_data = [
             data
             for data in serialized_conversations
-            if data["owner_user_id"] is None
-            or data["owner_user_id"] in existing_owner_ids
+            if participant_ids(data)
+            or data.get("shared", data["owner_user_id"] is None)
         ]
         trigger_ids = id_mapping.get("agent_triggers", {})
         conversations = [
@@ -1914,7 +1963,13 @@ class AgentHandler:
                 uuid=uuid4(),
                 title=data["title"],
                 pinned=data.get("pinned", False),
-                owner_user_id=data["owner_user_id"],
+                owner_user_id=data["owner_user_id"]
+                if data["owner_user_id"] in existing_users
+                else None,
+                shared=data.get("shared", data["owner_user_id"] is None),
+                started_by_trigger=data.get(
+                    "started_by_trigger", data["owner_user_id"] is None
+                ),
                 trigger_id=trigger_ids.get(data.get("trigger_id")),
             )
             for data in retained_data
@@ -1924,9 +1979,13 @@ class AgentHandler:
         messages = []
         message_data = []
         for conversation, data in zip(conversations, retained_data):
+            conversation.participants.add(*participant_ids(data))
             conversation.created_on = parse_datetime(data["created_on"])
             conversation.updated_on = parse_datetime(data["updated_on"])
             for serialized_message in data["messages"]:
+                sender_id = serialized_message.get(
+                    "sender_id", conversation.owner_user_id
+                )
                 status = serialized_message["status"]
                 error_code = serialized_message["error_code"]
                 # Approvals are not copied, so a waiting reply could never resume.
@@ -1941,6 +2000,10 @@ class AgentHandler:
                         conversation=conversation,
                         uuid=uuid4(),
                         role=serialized_message["role"],
+                        sender_id=sender_id if sender_id in existing_users else None,
+                        unattended=serialized_message.get(
+                            "unattended", conversation.started_by_trigger
+                        ),
                         content=serialized_message["content"],
                         status=status,
                         error_code=error_code,

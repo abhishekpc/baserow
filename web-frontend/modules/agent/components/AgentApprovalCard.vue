@@ -20,35 +20,37 @@
             : $t('agent.approvalReviewed')
         }}
       </span>
-      <Button
-        v-if="pending.length && canAlwaysAllow"
-        type="secondary"
-        size="small"
-        class="agent-approval__always-allow"
-        :disabled="locked"
-        :title="alwaysAllowTitle"
-        @click="approve(pending, { alwaysAllow: true })"
-      >
-        {{ alwaysAllowLabel }}
-      </Button>
-      <div v-if="pending.length" class="agent-approval__actions">
+      <div v-if="pending.length" class="agent-approval__controls">
         <Button
+          v-if="canAlwaysAllow"
           type="secondary"
           size="small"
+          class="agent-approval__always-allow"
           :disabled="locked"
-          @click="askToReject(pending, $event)"
+          :title="alwaysAllowTitle"
+          @click="approve(pending, { alwaysAllow: true })"
         >
-          {{ $t(pending.length > 1 ? 'agent.rejectAll' : 'agent.reject') }}
+          {{ alwaysAllowLabel }}
         </Button>
-        <Button
-          ref="headerApprove"
-          type="primary"
-          size="small"
-          :disabled="locked"
-          @click="approve(pending)"
-        >
-          {{ $t(pending.length > 1 ? 'agent.approveAll' : 'agent.approve') }}
-        </Button>
+        <div class="agent-approval__actions">
+          <Button
+            type="secondary"
+            size="small"
+            :disabled="locked"
+            @click="askToReject(pending, $event)"
+          >
+            {{ $t(pending.length > 1 ? 'agent.rejectAll' : 'agent.reject') }}
+          </Button>
+          <Button
+            ref="headerApprove"
+            type="primary"
+            size="small"
+            :disabled="locked"
+            @click="approve(pending)"
+          >
+            {{ $t(pending.length > 1 ? 'agent.approveAll' : 'agent.approve') }}
+          </Button>
+        </div>
       </div>
       <div v-else class="agent-approval__summary">
         <span v-if="approvedCount">
@@ -166,8 +168,6 @@
 <script setup>
 import { computed, inject, reactive, ref, useId, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { useNuxtApp } from '#app'
-import { agentToolLabel } from '@baserow/modules/agent/agentTools'
 import AgentRejectModal from '@baserow/modules/agent/components/AgentRejectModal'
 import ChatToolInput from '@baserow/modules/core/components/chat/ChatToolInput'
 import { STEP_STATUS } from '@baserow/modules/core/chatRuns/constants'
@@ -202,24 +202,25 @@ const locked = computed(() => props.disabled || props.deciding)
 const pending = computed(() =>
   props.items.filter((item) => item.status === APPROVAL_STATUS.PENDING)
 )
-const { $registry } = useNuxtApp()
 const { locale, t } = useI18n()
-const pendingToolNames = computed(() =>
-  [...new Set(pending.value.map((item) => item.tool))].map((tool) =>
-    agentToolLabel(tool, $registry, t)
+const pendingToolNames = computed(() => [
+  ...new Map(
+    pending.value.map(({ tool, toolLabel }) => [tool, toolLabel])
+  ).values(),
+])
+const alwaysAllowLabel = computed(() =>
+  t(
+    pendingToolNames.value.length > 1
+      ? 'agent.alwaysApproveAll'
+      : 'agent.alwaysApprove'
   )
 )
-const alwaysAllowLabel = computed(() =>
-  pendingToolNames.value.length > 1
-    ? t('agent.alwaysAllowAllPendingTools')
-    : t('agent.alwaysAllowTools', { tools: pendingToolNames.value[0] })
-)
 const alwaysAllowTitle = computed(() =>
-  pendingToolNames.value.length > 1
-    ? new Intl.ListFormat(locale.value, { type: 'conjunction' }).format(
-        pendingToolNames.value
-      )
-    : null
+  t('agent.alwaysApproveHint', {
+    tools: new Intl.ListFormat(locale.value, { type: 'conjunction' }).format(
+      pendingToolNames.value
+    ),
+  })
 )
 const countOf = (status) =>
   props.items.filter((item) => item.status === status).length

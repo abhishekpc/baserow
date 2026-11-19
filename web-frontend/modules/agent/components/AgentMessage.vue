@@ -14,7 +14,7 @@
   </ChatMessage>
   <ChatMessage
     v-else
-    :own="own"
+    :own="isOwnMessage"
     :class="{ 'chat-message--steps': entries.length }"
   >
     <template v-for="entry in entries" :key="entry.key">
@@ -37,7 +37,12 @@
         :item-errors="entry.group.itemErrors || []"
       />
     </template>
-    <div v-if="own" class="chat-message__bubble">{{ message.content }}</div>
+    <span v-if="isUserMessage && !isOwnMessage" class="chat-message__note">
+      {{ message.sender?.name || $t('agent.deletedSender') }}
+    </span>
+    <div v-if="isUserMessage" class="chat-message__bubble">
+      {{ message.content }}
+    </div>
     <div
       v-else-if="shown.content || (shown.replying && !toolRunning)"
       class="chat-message__bubble"
@@ -84,6 +89,7 @@ import {
   isTerminalStatus,
   STEP_STATUS,
 } from '@baserow/modules/core/chatRuns/constants'
+import { agentToolLabel } from '@baserow/modules/agent/agentTools'
 import AgentApprovalCard from '@baserow/modules/agent/components/AgentApprovalCard'
 import AgentTriggerStartCard from '@baserow/modules/agent/components/AgentTriggerStartCard'
 import { replyOutcome } from '@baserow/modules/agent/utils/replies'
@@ -109,7 +115,12 @@ defineEmits(['decide'])
 const store = useStore()
 const { $registry } = useNuxtApp()
 const { t } = useI18n()
-const own = computed(() => props.message.role === MESSAGE_ROLE.USER)
+const isUserMessage = computed(() => props.message.role === MESSAGE_ROLE.USER)
+const isOwnMessage = computed(
+  () =>
+    isUserMessage.value &&
+    props.message.sender?.id === store.getters['auth/getUserId']
+)
 /** The saved message, with each field its unsaved run already wrote. */
 const shown = computed(() => {
   const { message } = props
@@ -150,6 +161,13 @@ function approvalItem(step, approval) {
     stepStatus: status,
     changesData,
     tool: approval.tool,
+    toolLabel:
+      step.input?.server && step.input?.tool
+        ? t('agent.toolMCPNamed', {
+            tool: step.input.tool,
+            server: step.input.server,
+          })
+        : agentToolLabel(approval.tool, $registry, t),
     title,
     input,
     failureHint,
@@ -195,10 +213,12 @@ function stepEntries(steps, approvals) {
 
 // Stable arrays let text deltas skip rebuilding and re-rendering the steps.
 const steps = computed(() =>
-  own.value || !Array.isArray(shown.value.steps) ? NO_STEPS : shown.value.steps
+  isUserMessage.value || !Array.isArray(shown.value.steps)
+    ? NO_STEPS
+    : shown.value.steps
 )
 const approvals = computed(() =>
-  own.value || !Array.isArray(shown.value.approvals)
+  isUserMessage.value || !Array.isArray(shown.value.approvals)
     ? NO_APPROVALS
     : shown.value.approvals
 )

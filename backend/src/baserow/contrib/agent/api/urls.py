@@ -4,12 +4,15 @@ from .action_tools import urls as action_tools_urls
 from .triggers import urls as triggers_urls
 from .views import (
     AgentApplicationView,
+    AgentApprovalRecipientsView,
     AgentConfigurationView,
     AgentConversationsView,
     AgentConversationView,
     AgentMessagesView,
     AgentRunAsIdentitiesView,
     AgentToolApprovalsView,
+    LeaveAgentConversationView,
+    ShareAgentConversationView,
 )
 
 app_name = "baserow.contrib.agent"
@@ -45,6 +48,21 @@ urlpatterns = [
         "<int:agent_id>/conversations/<uuid:conversation_uuid>/approvals/",
         AgentToolApprovalsView.as_view(),
         name="approvals",
+    ),
+    path(
+        "<int:agent_id>/conversations/<uuid:conversation_uuid>/share/",
+        ShareAgentConversationView.as_view(),
+        name="share_conversation",
+    ),
+    path(
+        "<int:agent_id>/conversations/<uuid:conversation_uuid>/leave/",
+        LeaveAgentConversationView.as_view(),
+        name="leave_conversation",
+    ),
+    path(
+        "<int:agent_id>/conversations/<uuid:conversation_uuid>/approval-recipients/",
+        AgentApprovalRecipientsView.as_view(),
+        name="approval_recipients",
     ),
     path("", include(triggers_urls, namespace="triggers")),
     path("", include(action_tools_urls, namespace="actions")),

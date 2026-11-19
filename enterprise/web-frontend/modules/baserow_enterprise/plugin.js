@@ -5,6 +5,7 @@ import {
 import { registerRealtimeEvents } from '@baserow_enterprise/realtime'
 import {
   RolePermissionManagerType,
+  AgentParticipationPermissionManagerType,
   WriteFieldValuesPermissionManagerType,
 } from '@baserow_enterprise/permissionManagerTypes'
 import {
@@ -157,6 +158,10 @@ export default defineNuxtPlugin({
 
     const context = { app: nuxtApp }
 
+    $registry.register(
+      'permissionManager',
+      new AgentParticipationPermissionManagerType(context)
+    )
     $registry.register('plugin', new EnterprisePlugin(context))
     $registry.register(
       'aiProviderModelFeature',
