@@ -14,6 +14,13 @@ open-source software.
 Click to deploy: [https://elest.io/open-source/baserow](https://elest.io/open-source/baserow)
 
 
+## PikaPods
+
+[PikaPods](https://www.pikapods.com) is a managed hosting service for open-source apps,
+with automatic updates and free SSL on your own domain.
+
+Click to deploy: [https://www.pikapods.com/apps/baserow](https://www.pikapods.com/apps/baserow)
+
 ## Clovyr
 
 [Clovyr](https://clovyr.app/) is browser-based ecosystem that allows you to find and run

@@ -69,6 +69,7 @@ Join our forum at https://community.baserow.io/. See
 * [**Cloudron**: Install and update Baserow on your own Cloudron server.](docs/installation/install-on-cloudron.md)
 * [**Railway**: Install Baserow via Railway.](docs/installation/install-on-railway.md)
 * [**Elestio**: Fully managed by Elestio.](https://elest.io/open-source/baserow)
+* [**PikaPods**: Fully managed by PikaPods.](https://www.pikapods.com/apps/baserow)
 
 ## Official documentation
 
